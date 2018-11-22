@@ -1,15 +1,22 @@
 import os
+import io
+import sys
 import mxnet as mx
 import numpy as np
 import cv2
 import logging
 import lmdb
+#import leveldb
 import random
+import shutil
+from datetime import datetime
+from PIL import Image
+#import StringIO
+import time
+from multiprocessing.pool import ThreadPool
 import argparse
 
-"""
-수정 예정
-"""
+
 def get_prop(txn, key, default, check=False):
     v = txn.get(key)
     if v is None:
@@ -32,6 +39,7 @@ def addto_db(db_path, path, suffix_list, chunk_size=24 * 60 * 3, chunk_base=1000
     sprefix_list = ''
     sidx = ''
     env = lmdb.open(db_path, map_size=1 << 40, max_dbs=5)
+    print(env)
     with env.begin(write=True) as txn:
         N = get_prop(txn, 'N', N)
         chunk_size = get_prop(txn, 'chunk_size', chunk_size)
@@ -85,42 +93,95 @@ def addto_db(db_path, path, suffix_list, chunk_size=24 * 60 * 3, chunk_base=1000
         txn.put('prefix_list', ','.join(prefix_list))
         txn.put('idx', '$'.join(idx))
 
+
+def show_db(fdb, suffix_list):
+    print('Showing db ' + fdb)
+    env = lmdb.open(fdb, max_dbs=5)
+    with env.begin() as txn:
+        N = int(txn.get('N'))
+        chunk_size = int(txn.get('chunk_size'))
+        chunk_base = int(txn.get('chunk_base'))
+        movie_base = int(txn.get('movie_base'))
+        prefix_list = txn.get('prefix_list')
+        idx = [[[int(k) for k in j.split(',')] for j in i.split('|')] for i in txn.get('idx').split('$')]
+        print(len(idx))
+        print(prefix_list)
+        print(N, chunk_size, chunk_base, movie_base)
+
+    assert len(prefix_list.split(',')) == N
+    assert len(idx) == N
+
+    for i in range(N):
+        print('mov', i)
+        base = i * movie_base
+        ichunk = 0
+        while True:
+            pj = None
+            for suffix in suffix_list:
+                with env.begin(db=env.open_db(suffix)) as txn:
+                    for j in range(chunk_base):
+                        v = txn.get('%09d' % (base + ichunk * chunk_base + j))
+                        if v is None:
+                            break
+                        assert base + ichunk * chunk_base + j == idx[i][ichunk][j]
+                assert pj is None or pj == j
+                pj = j
+            if j > 0:
+                assert ichunk < len(idx[i])
+                assert j == len(idx[i][ichunk]), '%d vs %d' % (j, len(idx[i][ichunk]))
+                print('chunk', ichunk)
+                ichunk += 1
+            if j < chunk_size - 1:
+                print('mov', i, 'finish at', ichunk)
+                break
+        assert ichunk == len(idx[i])
+
+
 def shuffle(path, valid_ratio=0.1, test_ratio=0.3):
     sidx = ''
     env = lmdb.open(path, map_size=1 << 40, max_dbs=5)
     with env.begin() as txn:
         sidx = txn.get('idx')
         prefix_list = txn.get('prefix_list').split(',')
-    idx = [[[k for k in i.split(',')] for i in j.split('|')][1:-3] for j in sidx.split('$')]
+    idx = [j for j in sidx.split(',')]
     p = list(range(len(idx)))
     random.shuffle(p)
     idx = [idx[i] for i in p]
-    prefix_list = [prefix_list[i] for i in p]
+    e_prefix_list = [None]*len(p)
+    _set = 0
+    for i in p:
+        e_prefix_list[i] = prefix_list[_set]
+        if _set == len(prefix_list)-1:
+            _set = 0
+        else :
+            _set += 1
+    prefix_list = e_prefix_list
+# prefix_list = [prefix_list[0] for i in p]
 
     sep = int((1 - test_ratio) * len(idx))
-
+    print(sep)
     print('train ', prefix_list[:sep])
     print('test ', prefix_list[sep:])
 
-    train_idx = sum(idx[:sep], [])
+    train_idx = list(idx[:sep])
     random.shuffle(train_idx)
     vsep = int((1 - valid_ratio) * len(train_idx))
-    valid_idx = sum(train_idx[vsep:], [])
+    valid_idx = list(train_idx[vsep:])
     random.shuffle(valid_idx)
     svalid_idx = ','.join(valid_idx)
 
-    train_idx = sum(train_idx[:vsep], [])
+    train_idx = list(train_idx[:vsep])
     random.shuffle(train_idx)
     strain_idx = ','.join(train_idx)
 
-    test_idx = sum(idx[sep:], [])
+    test_idx = list(idx[sep:])
     random.shuffle(test_idx)
-    test_idx = sum(test_idx, [])
     stest_idx = ','.join(test_idx)
 
     random.shuffle(test_idx)
     sshuffled_test_idx = ','.join(test_idx)
 
+    print("test_idx:",test_idx)
     print(len(train_idx), len(valid_idx), len(test_idx))
     with env.begin(write=True) as txn:
         txn.put('train_idx', strain_idx)
@@ -232,11 +293,16 @@ class Mov3dStack(mx.io.DataIter):
 
         self.cur = 0
         with self.env.begin() as txn:
+#print(txn)
             if source:
                 self.idx = [int(i) for i in txn.get(source).split(',')]
             elif self.test_mode:
                 self.idx = [int(i) for i in txn.get('shuffled_test_idx').split(',')]
             else:
+#print(txn.get('shuffled_test_idx'))
+#if txn.get('shuffled_test_idx') == ' ' :
+#self.idx = [0]
+#else:
                 self.idx = [int(i) for i in txn.get('shuffled_test_idx').split(',')]
             if self.upsample > 1:
                 self.caps = [cv2.VideoCapture('data/raw/%s.mkv' % p) for p in txn.get('prefix_list').split(',')]
@@ -320,8 +386,6 @@ class Mov3dStack(mx.io.DataIter):
                     ret, frame = self.caps[mov].read()
                     assert ret
                     margin = (frame.shape[0] - 800) / 2
-                    #rfream 구하는 곳 프레임에 맞게 한장한장
-                    #여기 싸그리다 무시
                     lframe, rframe = split(frame, reshape=self.base_shape, vert=True,
                                            clip=(0, margin, 960, margin + 800))
 
@@ -351,13 +415,11 @@ class Mov3dStack(mx.io.DataIter):
                         pass
                     else:
                         _, s = mx.recordio.unpack(sl)
-                        mx.nd.imdecode(s, clip_rect=(p[0], p[1], p[0] + self.data_shape[0], p[1] + self.data_shape[1]),
-                                       out=ndleft, index=i * self.data_frames + j, channels=3, mean=self.left_mean_nd)
+                        mx.nd.imdecode(s, clip_rect=(p[0], p[1], p[0] + self.data_shape[0], p[1] + self.data_shape[1]),out=ndleft, index=i * self.data_frames + j, channels=3, mean=self.left_mean_nd)
 
                 if self.upsample > 1:
                     limg, p = crop_img(lframe, p,
-                                       (self.data_shape[0] * self.upsample, self.data_shape[1] * self.upsample), 0,
-                                       test=self.test_mode, grid=self.upsample)
+                                       (self.data_shape[0] * self.upsample, self.data_shape[1] * self.upsample), 0,test=self.test_mode, grid=self.upsample)
                     left0[i] = limg
                 else:
                     start = i * max(1, self.data_frames) + max(1, self.data_frames) / 2
@@ -369,8 +431,7 @@ class Mov3dStack(mx.io.DataIter):
                         pass
                     else:
                         _, s = mx.recordio.unpack(sf)
-                        mx.nd.imdecode(s, clip_rect=(p[0], p[1], p[0] + self.data_shape[0], p[1] + self.data_shape[1]),
-                                       out=ndflow, index=i * self.flow_frames + j, channels=2, mean=self.flow_mean_nd)
+                        mx.nd.imdecode(s, clip_rect=(p[0], p[1], p[0] + self.data_shape[0], p[1] + self.data_shape[1]),out=ndflow, index=i * self.flow_frames + j, channels=2, mean=self.flow_mean_nd)
                 self.cur += 1
 
         data = []
@@ -398,7 +459,7 @@ class Mov3dStack(mx.io.DataIter):
             return mx.io.DataBatch(data, [mx.nd.array(right)], pad, None)
 
 
-def load_vgg(data_frames=1, flow_frames=1):
+def load_vgg(data_frames=1, flow_frames=1, two_stream=False):
     vgg16 = {name: arr for name, arr in mx.nd.load('vgg16-0001.params').items() if name.startswith('arg:conv')}
     conv1_weight = vgg16['arg:conv1_1_weight']
 
@@ -418,13 +479,15 @@ def load_vgg(data_frames=1, flow_frames=1):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Put recordio files into lmdb')
-    parser.add_argument('path', type=str,default="이미지 파일 경로", help='Path to folder containing recordio files')
-    parser.add_argument('fdb', type=str, default="저장 파일 경로" ,help='Path to output lmdb')
+    parser.add_argument('path', type=str, help='Path to folder containing recordio files')
+    parser.add_argument('fdb', type=str, help='Path to output lmdb')
     args = parser.parse_args()
 
     path = args.path
     fdb = args.fdb
     suffix_list = ['l', 'r']
+    # uncomment if working with optical flow or depth data.
+    # suffix_list = ['depth', 'flow', 'l', 'r']
 
     pset = set()
     for fname in os.listdir(path):
@@ -434,5 +497,6 @@ if __name__ == '__main__':
     for fname in pset:
         addto_db(fdb, path + fname, suffix_list)
 
+    show_db(fdb, suffix_list)
     shuffle(fdb)
     make_idx(fdb)
